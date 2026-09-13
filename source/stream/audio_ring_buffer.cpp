@@ -145,11 +145,14 @@ bool AudioRingBuffer::producerWrite(
 
     const auto write_sequence =
         write_sequence_.load(std::memory_order_relaxed);
-    const auto read_sequence = std::max(
+    const auto effective_read_sequence = std::max(
         read_sequence_.load(std::memory_order_acquire),
         discard_sequence_.load(std::memory_order_acquire));
-    const std::size_t queued = static_cast<std::size_t>(
-        write_sequence - read_sequence);
+    const std::size_t queued =
+        write_sequence > effective_read_sequence
+            ? static_cast<std::size_t>(
+                  write_sequence - effective_read_sequence)
+            : 0;
     std::size_t queued_after_discard = queued;
     if (queued + frames > high_watermark_frames_)
     {
@@ -171,9 +174,18 @@ bool AudioRingBuffer::producerWrite(
             const std::size_t discarded_blocks =
                 (discard_frames + controlBlockFrames() - 1) /
                 controlBlockFrames();
-            discard_sequence_.fetch_add(
-                discard_frames,
-                std::memory_order_release);
+            const auto discard_target =
+                effective_read_sequence + discard_frames;
+            auto observed_discard =
+                discard_sequence_.load(std::memory_order_relaxed);
+            while (observed_discard < discard_target &&
+                   !discard_sequence_.compare_exchange_weak(
+                       observed_discard,
+                       discard_target,
+                       std::memory_order_release,
+                       std::memory_order_relaxed))
+            {
+            }
             queued_after_discard -= discard_frames;
             dropped_oldest_blocks_.fetch_add(
                 discarded_blocks,
@@ -244,13 +256,24 @@ void AudioRingBuffer::consumerRead(
     }
 
     callback_count_.fetch_add(1, std::memory_order_relaxed);
+    if (!callback_started)
+    {
+        std::memset(
+            output,
+            0,
+            framesToSamples(frames, channels_) * sizeof(int16_t));
+        return;
+    }
+
     const auto read_sequence = std::max(
         read_sequence_.load(std::memory_order_relaxed),
         discard_sequence_.load(std::memory_order_acquire));
     const auto write_sequence =
         write_sequence_.load(std::memory_order_acquire);
-    const std::size_t queued = static_cast<std::size_t>(
-        write_sequence - read_sequence);
+    const std::size_t queued =
+        write_sequence > read_sequence
+            ? static_cast<std::size_t>(write_sequence - read_sequence)
+            : 0;
     const std::size_t readable = std::min(frames, queued);
 
     if (readable > 0)
@@ -295,13 +318,16 @@ void AudioRingBuffer::consumerRead(
         }
     }
 
-    const auto remaining_sequence =
-        write_sequence_.load(std::memory_order_acquire) -
-        std::max(
-            read_sequence_.load(std::memory_order_relaxed),
-            discard_sequence_.load(std::memory_order_acquire));
+    const auto remaining_write =
+        write_sequence_.load(std::memory_order_acquire);
+    const auto remaining_read = std::max(
+        read_sequence_.load(std::memory_order_relaxed),
+        discard_sequence_.load(std::memory_order_acquire));
     const std::size_t remaining =
-        static_cast<std::size_t>(remaining_sequence);
+        remaining_write > remaining_read
+            ? static_cast<std::size_t>(
+                  remaining_write - remaining_read)
+            : 0;
     std::size_t observed =
         max_queued_frames_.load(std::memory_order_relaxed);
     while (remaining > observed &&
@@ -330,8 +356,10 @@ std::size_t AudioRingBuffer::currentFrames() const
         discard_sequence_.load(std::memory_order_acquire));
     const auto write_sequence =
         write_sequence_.load(std::memory_order_acquire);
-    return static_cast<std::size_t>(
-        write_sequence - read_sequence);
+    return write_sequence > read_sequence
+               ? static_cast<std::size_t>(
+                     write_sequence - read_sequence)
+               : 0;
 }
 
 std::size_t AudioRingBuffer::capacityFrames() const

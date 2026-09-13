@@ -79,14 +79,15 @@ TEST(audio_ring_prefill_waits_and_outputs_in_order)
     CHECK(ring->producerWrite(signal.data(), 480));
     CHECK_EQ(ring->currentFrames(), 480u);
     ring->consumerRead(output.data(), 480, false, 0);
-    check_signal(output, signal);
-
-    std::fill(output.begin(), output.end(), 0);
-    ring->consumerRead(output.data(), 480, false, 0);
     CHECK(std::all_of(
         output.begin(),
         output.end(),
         [](int16_t value) { return value == 0; }));
+    CHECK_EQ(ring->currentFrames(), 480u);
+
+    ring->consumerRead(output.data(), 480, true, 0);
+    check_signal(output, signal);
+    CHECK_EQ(ring->currentFrames(), 0u);
     CHECK_EQ(ring->stats().underrun_callbacks, 0u);
 }
 
@@ -129,6 +130,60 @@ TEST(audio_ring_high_watermark_drops_oldest_blocks)
         std::vector<int16_t>(
             first.begin() + 1440 * 2,
             first.begin() + 2400 * 2));
+}
+
+TEST(audio_ring_high_watermark_uses_absolute_sequence_after_playback)
+{
+    auto ring = make_ring();
+    const auto warmup = make_signal(480, 2, 10);
+    const auto queued = make_signal(2400, 2, 100);
+    const auto incoming = make_signal(480, 2, 9000);
+    std::vector<int16_t> output(480 * 2);
+
+    for (int i = 0; i < 10; ++i)
+    {
+        CHECK(ring->producerWrite(warmup.data(), 480));
+        ring->consumerRead(output.data(), 480, true, 0);
+    }
+
+    CHECK(ring->producerWrite(queued.data(), 2400));
+    CHECK_EQ(ring->currentFrames(), 2400u);
+    CHECK(ring->producerWrite(incoming.data(), 480));
+    CHECK_EQ(ring->currentFrames(), 1440u);
+    CHECK(ring->currentFrames() <= ring->capacityFrames());
+
+    const auto stats = ring->stats();
+    CHECK_EQ(stats.dropped_oldest_blocks, 3u);
+    CHECK_EQ(stats.dropped_oldest_frames, 1440u);
+
+    std::vector<int16_t> recovered(960 * 2);
+    ring->consumerRead(recovered.data(), 960, true, 0);
+    check_signal(
+        recovered,
+        std::vector<int16_t>(
+            queued.begin() + 1440 * 2,
+            queued.end()));
+}
+
+TEST(audio_ring_repeated_high_watermark_drops_stay_within_capacity)
+{
+    auto ring = make_ring();
+    const auto block = make_signal(480, 2, 100);
+    std::vector<int16_t> output(480 * 2);
+
+    for (int i = 0; i < 100; ++i)
+    {
+        CHECK(ring->producerWrite(block.data(), 480));
+        ring->consumerRead(output.data(), 480, true, 0);
+    }
+
+    const auto backlog = make_signal(2400, 2, 1000);
+    CHECK(ring->producerWrite(backlog.data(), 2400));
+    for (int i = 0; i < 100; ++i)
+    {
+        CHECK(ring->producerWrite(block.data(), 480));
+        CHECK(ring->currentFrames() <= ring->capacityFrames());
+    }
 }
 
 TEST(audio_ring_underrun_pads_silence_and_counts)

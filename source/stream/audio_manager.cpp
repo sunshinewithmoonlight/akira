@@ -151,31 +151,27 @@ void AudioManager::play(int16_t* buf, size_t samples_count)
         return;
     }
 
-    const std::size_t sample_count = samples_count * channels;
-    for (size_t x = 0; x < sample_count; x++)
+    SDL_LockAudioDevice(m_device_id);
+    if (m_shutdown.load(std::memory_order_acquire))
     {
-        int sample = buf[x] * 1.80;
-        if (sample > INT16_MAX)
-        {
-            buf[x] = INT16_MAX;
-        }
-        else if (sample < INT16_MIN)
-        {
-            buf[x] = INT16_MIN;
-        }
-        else
-        {
-            buf[x] = (int16_t)sample;
-        }
+        SDL_UnlockAudioDevice(m_device_id);
+        return;
     }
 
     m_ring.producerWrite(buf, samples_count);
     const auto queued = m_ring.currentFrames();
+    bool prefill_completed = false;
     if (!m_playback_started.load(std::memory_order_acquire) &&
         queued >= prefillFrames())
     {
         m_playback_started.store(true, std::memory_order_release);
         m_ring.notePrefillComplete();
+        prefill_completed = true;
+    }
+    SDL_UnlockAudioDevice(m_device_id);
+
+    if (prefill_completed)
+    {
         brls::Logger::info(
             "Audio prefill complete at {} frames, starting SDL playback",
             queued);
@@ -255,6 +251,11 @@ void AudioManager::audioCallback(Uint8* stream, int len)
         frames,
         started,
         missing);
+    if (started && missing > 0)
+    {
+        m_playback_started.store(false, std::memory_order_release);
+        m_ring.notePrefillStart();
+    }
     m_callback_active.store(false, std::memory_order_release);
 }
 
@@ -262,13 +263,16 @@ void AudioManager::logSummary(bool force)
 {
     const auto now = steadySeconds();
     auto last = m_last_summary_second.load(std::memory_order_relaxed);
-    if (!force &&
-        !m_last_summary_second.compare_exchange_strong(
-            last,
-            now,
-            std::memory_order_relaxed))
+    if (!force)
     {
-        return;
+        if (now <= last ||
+            !m_last_summary_second.compare_exchange_strong(
+                last,
+                now,
+                std::memory_order_relaxed))
+        {
+            return;
+        }
     }
 
     const auto stats = m_ring.stats();
