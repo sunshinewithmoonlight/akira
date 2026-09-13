@@ -86,9 +86,7 @@ bool AudioManager::init(unsigned int channels, unsigned int rate)
         0,
         &want,
         &have,
-        SDL_AUDIO_ALLOW_FREQUENCY_CHANGE |
-            SDL_AUDIO_ALLOW_CHANNELS_CHANGE |
-            SDL_AUDIO_ALLOW_FORMAT_CHANGE);
+        0);
     if (m_device_id == 0)
     {
         m_open_errors.fetch_add(1, std::memory_order_relaxed);
