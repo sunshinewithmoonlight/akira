@@ -210,6 +210,13 @@ private:
 
     static constexpr uint32_t kDirectFailureLimit = 16;
 
+    enum class DirectDiscoveryState {
+        Unknown,
+        Failed,
+        Empty,
+        Candidates,
+    };
+
     mutable Mutex         m_srv_lock{};
 
     std::atomic<uint32_t> m_direct_seq{0};
@@ -223,6 +230,7 @@ private:
 
     uint8_t  m_direct_addr[6]{};
     bool     m_direct_addr_valid = false;
+    DirectDiscoveryState m_direct_discovery_state = DirectDiscoveryState::Unknown;
     bool     m_owns_output       = false;
 
     static std::atomic<bool> s_output_refused;
