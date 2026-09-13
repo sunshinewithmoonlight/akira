@@ -2,6 +2,7 @@
 #include <borealis.hpp>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <limits>
 
@@ -13,6 +14,7 @@ constexpr unsigned int kTargetWatermarkMs = 30;
 constexpr unsigned int kHighWatermarkMs = 50;
 constexpr unsigned int kCapacityMs = 60;
 constexpr unsigned int kControlBlockMs = 10;
+constexpr Uint16 kSwitchOutputFrames = 1024;
 
 std::uint64_t steadySeconds()
 {
@@ -20,6 +22,40 @@ std::uint64_t steadySeconds()
         std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now().time_since_epoch())
             .count());
+}
+
+std::uint64_t steadyMicroseconds()
+{
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+
+template <typename T>
+void updateAtomicMin(std::atomic<T>& target, T value)
+{
+    auto observed = target.load(std::memory_order_relaxed);
+    while (value < observed &&
+           !target.compare_exchange_weak(
+               observed,
+               value,
+               std::memory_order_relaxed))
+    {
+    }
+}
+
+template <typename T>
+void updateAtomicMax(std::atomic<T>& target, T value)
+{
+    auto observed = target.load(std::memory_order_relaxed);
+    while (value > observed &&
+           !target.compare_exchange_weak(
+               observed,
+               value,
+               std::memory_order_relaxed))
+    {
+    }
 }
 
 } // namespace
@@ -64,15 +100,13 @@ bool AudioManager::init(unsigned int channels, unsigned int rate)
     want.freq = rate;
     want.format = AUDIO_S16SYS;
     want.channels = channels;
-    want.samples = static_cast<Uint16>(
-        std::max<std::size_t>(
-            1,
-            std::min<std::size_t>(
-                static_cast<std::size_t>(rate) * kControlBlockMs / 1000,
-                std::numeric_limits<Uint16>::max())));
+    // The Switch SDL2 audren backend is unstable with small, non-power-of-two
+    // wave buffers. Chiaki's established Switch path uses 1024 frames.
+    want.samples = kSwitchOutputFrames;
     want.callback = &AudioManager::sdlAudioCallback;
     want.userdata = this;
 
+    resetDiagnostics();
     m_shutdown.store(false, std::memory_order_release);
     m_callback_active.store(false, std::memory_order_release);
     m_playback_started.store(false, std::memory_order_release);
@@ -151,7 +185,51 @@ void AudioManager::play(int16_t* buf, size_t samples_count)
         return;
     }
 
+    const std::size_t sample_count = samples_count * channels;
+    std::int64_t sample_sum = 0;
+    std::uint64_t square_sum = 0;
+    std::uint64_t clipped_samples = 0;
+    std::uint64_t zero_samples = 0;
+    std::uint64_t abs_peak = 0;
+    for (std::size_t index = 0; index < sample_count; ++index)
+    {
+        const auto sample = static_cast<std::int32_t>(buf[index]);
+        const auto magnitude = static_cast<std::uint64_t>(
+            sample < 0 ? -sample : sample);
+        sample_sum += sample;
+        square_sum += static_cast<std::uint64_t>(
+            static_cast<std::int64_t>(sample) * sample);
+        clipped_samples +=
+            sample == std::numeric_limits<std::int16_t>::min() ||
+                    sample == std::numeric_limits<std::int16_t>::max()
+                ? 1
+                : 0;
+        zero_samples += sample == 0 ? 1 : 0;
+        abs_peak = std::max(abs_peak, magnitude);
+    }
+    m_pcm_sample_count.fetch_add(sample_count, std::memory_order_relaxed);
+    m_pcm_sample_sum.fetch_add(sample_sum, std::memory_order_relaxed);
+    m_pcm_square_sum.fetch_add(square_sum, std::memory_order_relaxed);
+    m_pcm_clipped_samples.fetch_add(
+        clipped_samples,
+        std::memory_order_relaxed);
+    m_pcm_zero_samples.fetch_add(zero_samples, std::memory_order_relaxed);
+    updateAtomicMax(m_pcm_abs_peak, abs_peak);
+    updateAtomicMin(
+        m_pcm_min_block_frames,
+        static_cast<std::uint64_t>(samples_count));
+    updateAtomicMax(
+        m_pcm_max_block_frames,
+        static_cast<std::uint64_t>(samples_count));
+
+    const auto lock_start_us = steadyMicroseconds();
     SDL_LockAudioDevice(m_device_id);
+    const auto lock_wait_us = steadyMicroseconds() - lock_start_us;
+    m_producer_lock_count.fetch_add(1, std::memory_order_relaxed);
+    m_producer_lock_wait_total_us.fetch_add(
+        lock_wait_us,
+        std::memory_order_relaxed);
+    updateAtomicMax(m_producer_lock_wait_max_us, lock_wait_us);
     if (m_shutdown.load(std::memory_order_acquire))
     {
         SDL_UnlockAudioDevice(m_device_id);
@@ -205,6 +283,33 @@ void AudioManager::resetRing()
     m_ring.clear();
 }
 
+void AudioManager::resetDiagnostics()
+{
+    m_last_callback_us.store(0, std::memory_order_relaxed);
+    m_callback_frames.store(0, std::memory_order_relaxed);
+    m_callback_started_frames.store(0, std::memory_order_relaxed);
+    m_callback_interval_count.store(0, std::memory_order_relaxed);
+    m_callback_interval_total_us.store(0, std::memory_order_relaxed);
+    m_callback_interval_min_us.store(
+        std::numeric_limits<std::uint64_t>::max(),
+        std::memory_order_relaxed);
+    m_callback_interval_max_us.store(0, std::memory_order_relaxed);
+    m_callback_bad_lengths.store(0, std::memory_order_relaxed);
+    m_producer_lock_count.store(0, std::memory_order_relaxed);
+    m_producer_lock_wait_total_us.store(0, std::memory_order_relaxed);
+    m_producer_lock_wait_max_us.store(0, std::memory_order_relaxed);
+    m_pcm_sample_count.store(0, std::memory_order_relaxed);
+    m_pcm_sample_sum.store(0, std::memory_order_relaxed);
+    m_pcm_square_sum.store(0, std::memory_order_relaxed);
+    m_pcm_clipped_samples.store(0, std::memory_order_relaxed);
+    m_pcm_zero_samples.store(0, std::memory_order_relaxed);
+    m_pcm_abs_peak.store(0, std::memory_order_relaxed);
+    m_pcm_min_block_frames.store(
+        std::numeric_limits<std::uint64_t>::max(),
+        std::memory_order_relaxed);
+    m_pcm_max_block_frames.store(0, std::memory_order_relaxed);
+}
+
 void AudioManager::sdlAudioCallback(
     void* userdata,
     Uint8* stream,
@@ -240,8 +345,35 @@ void AudioManager::audioCallback(Uint8* stream, int len)
         bytes_per_frame == 0
             ? 0
             : static_cast<std::size_t>(len) / bytes_per_frame;
+    if (bytes_per_frame == 0 ||
+        static_cast<std::size_t>(len) % bytes_per_frame != 0)
+    {
+        m_callback_bad_lengths.fetch_add(1, std::memory_order_relaxed);
+    }
+    m_callback_frames.fetch_add(frames, std::memory_order_relaxed);
+
+    const auto callback_us = steadyMicroseconds();
+    const auto previous_callback_us =
+        m_last_callback_us.exchange(callback_us, std::memory_order_relaxed);
+    if (previous_callback_us > 0 && callback_us >= previous_callback_us)
+    {
+        const auto interval_us = callback_us - previous_callback_us;
+        m_callback_interval_count.fetch_add(1, std::memory_order_relaxed);
+        m_callback_interval_total_us.fetch_add(
+            interval_us,
+            std::memory_order_relaxed);
+        updateAtomicMin(m_callback_interval_min_us, interval_us);
+        updateAtomicMax(m_callback_interval_max_us, interval_us);
+    }
+
     const auto started =
         m_playback_started.load(std::memory_order_acquire);
+    if (started)
+    {
+        m_callback_started_frames.fetch_add(
+            frames,
+            std::memory_order_relaxed);
+    }
     const auto before = m_ring.currentFrames();
     const std::size_t missing =
         started && before < frames ? frames - before : 0;
@@ -276,6 +408,33 @@ void AudioManager::logSummary(bool force)
     }
 
     const auto stats = m_ring.stats();
+    const auto callback_interval_count =
+        m_callback_interval_count.load(std::memory_order_relaxed);
+    const auto callback_interval_total_us =
+        m_callback_interval_total_us.load(std::memory_order_relaxed);
+    const auto callback_interval_min_us =
+        m_callback_interval_min_us.load(std::memory_order_relaxed);
+    const auto pcm_sample_count =
+        m_pcm_sample_count.load(std::memory_order_relaxed);
+    const auto pcm_sample_sum =
+        m_pcm_sample_sum.load(std::memory_order_relaxed);
+    const auto pcm_square_sum =
+        m_pcm_square_sum.load(std::memory_order_relaxed);
+    const auto pcm_min_block_frames =
+        m_pcm_min_block_frames.load(std::memory_order_relaxed);
+    const auto producer_lock_count =
+        m_producer_lock_count.load(std::memory_order_relaxed);
+    const double pcm_rms =
+        pcm_sample_count == 0
+            ? 0.0
+            : std::sqrt(
+                  static_cast<double>(pcm_square_sum) /
+                  static_cast<double>(pcm_sample_count));
+    const double pcm_dc =
+        pcm_sample_count == 0
+            ? 0.0
+            : static_cast<double>(pcm_sample_sum) /
+                  static_cast<double>(pcm_sample_count);
     brls::Logger::info(
         "audio-summary requested_freq={} obtained_freq={} "
         "requested_channels={} obtained_channels={} requested_format={} "
@@ -283,7 +442,15 @@ void AudioManager::logSummary(bool force)
         "decoded_pcm_blocks={} ring_current_samples={} ring_max_samples={} "
         "prefill_starts={} prefill_completions={} underrun_callbacks={} "
         "underrun_missing_samples={} dropped_oldest_blocks={} "
-        "dropped_oldest_samples={} callback_count={} open_errors={}",
+        "dropped_oldest_samples={} callback_count={} callback_frames={} "
+        "callback_started_frames={} callback_bad_lengths={} "
+        "callback_interval_count={} callback_interval_avg_us={} "
+        "callback_interval_min_us={} callback_interval_max_us={} "
+        "producer_lock_count={} producer_lock_wait_avg_us={} "
+        "producer_lock_wait_max_us={} pcm_samples={} pcm_rms={:.2f} "
+        "pcm_dc={:.2f} pcm_abs_peak={} pcm_clipped_samples={} "
+        "pcm_zero_samples={} pcm_min_block_frames={} "
+        "pcm_max_block_frames={} open_errors={}",
         m_requested.freq,
         m_obtained.freq,
         m_requested.channels,
@@ -302,5 +469,35 @@ void AudioManager::logSummary(bool force)
         stats.dropped_oldest_blocks,
         stats.dropped_oldest_frames,
         stats.callback_count,
+        m_callback_frames.load(std::memory_order_relaxed),
+        m_callback_started_frames.load(std::memory_order_relaxed),
+        m_callback_bad_lengths.load(std::memory_order_relaxed),
+        callback_interval_count,
+        callback_interval_count == 0
+            ? 0
+            : callback_interval_total_us / callback_interval_count,
+        callback_interval_min_us ==
+                std::numeric_limits<std::uint64_t>::max()
+            ? 0
+            : callback_interval_min_us,
+        m_callback_interval_max_us.load(std::memory_order_relaxed),
+        producer_lock_count,
+        producer_lock_count == 0
+            ? 0
+            : m_producer_lock_wait_total_us.load(
+                  std::memory_order_relaxed) /
+                  producer_lock_count,
+        m_producer_lock_wait_max_us.load(std::memory_order_relaxed),
+        pcm_sample_count,
+        pcm_rms,
+        pcm_dc,
+        m_pcm_abs_peak.load(std::memory_order_relaxed),
+        m_pcm_clipped_samples.load(std::memory_order_relaxed),
+        m_pcm_zero_samples.load(std::memory_order_relaxed),
+        pcm_min_block_frames ==
+                std::numeric_limits<std::uint64_t>::max()
+            ? 0
+            : pcm_min_block_frames,
+        m_pcm_max_block_frames.load(std::memory_order_relaxed),
         m_open_errors.load(std::memory_order_relaxed));
 }

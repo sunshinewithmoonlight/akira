@@ -108,6 +108,38 @@ TEST(audio_ring_wraps_without_losing_order)
     CHECK_EQ(ring->currentFrames(), 0u);
 }
 
+TEST(audio_ring_accepts_480_frame_writes_with_1024_frame_callbacks)
+{
+    auto ring = make_ring();
+    std::vector<int16_t> queued;
+    for (int block = 0; block < 5; ++block)
+    {
+        const auto signal = make_signal(
+            480,
+            2,
+            static_cast<int16_t>(block * 1000));
+        queued.insert(queued.end(), signal.begin(), signal.end());
+        CHECK(ring->producerWrite(signal.data(), 480));
+    }
+
+    std::vector<int16_t> first_output(1024 * 2);
+    ring->consumerRead(first_output.data(), 1024, true, 0);
+    check_signal(
+        first_output,
+        std::vector<int16_t>(
+            queued.begin(),
+            queued.begin() + 1024 * 2));
+
+    std::vector<int16_t> second_output(1024 * 2);
+    ring->consumerRead(second_output.data(), 1024, true, 0);
+    check_signal(
+        second_output,
+        std::vector<int16_t>(
+            queued.begin() + 1024 * 2,
+            queued.begin() + 2048 * 2));
+    CHECK_EQ(ring->currentFrames(), 352u);
+}
+
 TEST(audio_ring_high_watermark_drops_oldest_blocks)
 {
     auto ring = make_ring();
