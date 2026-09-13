@@ -1,4 +1,5 @@
 #include "input/extended_input_manager.hpp"
+#include "input/sample_cadence.hpp"
 
 #include <borealis.hpp>
 
@@ -457,6 +458,7 @@ void ExtendedInputManager::shutdown()
     m_direct_wanted.store(false, std::memory_order_release);
     m_direct_rumble.store(0, std::memory_order_relaxed);
     m_direct_addr_valid = false;
+    m_direct_discovery_state = DirectDiscoveryState::Unknown;
     m_direct_sent_valid = false;
     m_direct_logged     = false;
     m_direct_trigger_sent   = false;
@@ -1444,24 +1446,30 @@ void ExtendedInputManager::logRawReport(const char* when)
 
 void ExtendedInputManager::resolveDirectAddress()
 {
-    static uint32_t resolve_log = 0;
-    const bool log_this = (resolve_log++ % 20) == 0;
-
     AkiraInputDeviceList devices{};
     if (!listDevices(&devices)) {
-        if (log_this)
+        if (m_direct_discovery_state != DirectDiscoveryState::Failed)
             brls::Logger::warning("direct output: listDevices failed, no raw reports will be polled");
+        m_direct_discovery_state = DirectDiscoveryState::Failed;
         return;
     }
 
-    if (log_this && devices.count == 0)
-        brls::Logger::warning("direct output: device list empty, no raw reports will be polled");
-    for (uint8_t i = 0; log_this && i < devices.count; i++) {
-        const AkiraInputDeviceInfo& d = devices.devices[i];
-        brls::Logger::info("direct output: candidate {:04x}:{:04x} flags=0x{:02x} takes_direct={}",
-                           d.vendor_id, d.product_id, d.flags,
-                           akira::input::PadTakesDirectOutput(d.vendor_id, d.product_id));
+    if (devices.count == 0) {
+        if (m_direct_discovery_state != DirectDiscoveryState::Empty)
+            brls::Logger::info("direct output: device list empty, waiting for a controller");
+        m_direct_discovery_state = DirectDiscoveryState::Empty;
+        return;
     }
+
+    if (m_direct_discovery_state != DirectDiscoveryState::Candidates) {
+        for (uint8_t i = 0; i < devices.count; i++) {
+            const AkiraInputDeviceInfo& d = devices.devices[i];
+            brls::Logger::info("direct output: candidate {:04x}:{:04x} flags=0x{:02x} takes_direct={}",
+                               d.vendor_id, d.product_id, d.flags,
+                               akira::input::PadTakesDirectOutput(d.vendor_id, d.product_id));
+        }
+    }
+    m_direct_discovery_state = DirectDiscoveryState::Candidates;
 
     for (uint8_t i = 0; i < devices.count; i++) {
         const AkiraInputDeviceInfo& dev = devices.devices[i];
@@ -1489,9 +1497,11 @@ void ExtendedInputManager::resolveDirectAddress()
 void ExtendedInputManager::poll()
 {
     uint32_t ticks = 0;
+    akira::input::SampleCadence discovery_cadence(akira::input::DirectDiscoveryPeriod);
 
     while (m_running.load(std::memory_order_acquire)) {
-        if (!m_direct_addr_valid && (ticks % 60) == 0) {
+        if (!m_direct_addr_valid &&
+            discovery_cadence.due(akira::input::SampleCadence::Clock::now())) {
             resolveDirectAddress();
         }
 

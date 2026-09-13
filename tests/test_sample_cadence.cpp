@@ -51,3 +51,17 @@ TEST(sample_cadence_emits_only_once_after_a_long_stall)
     CHECK(!cadence.due(start + 101ms));
     CHECK(cadence.due(start + 116ms));
 }
+
+TEST(sample_cadence_limits_direct_device_discovery_to_twice_per_second)
+{
+    akira::input::SampleCadence cadence(akira::input::DirectDiscoveryPeriod);
+    const auto start = akira::input::SampleCadence::TimePoint{} + 1s;
+
+    int attempts = 0;
+    for (int inputSample = 0; inputSample < 120; inputSample++) {
+        if (cadence.due(start + akira::input::InputPollPeriod * inputSample))
+            attempts++;
+    }
+
+    CHECK_EQ(attempts, 2);
+}

@@ -7,6 +7,7 @@ namespace akira::input {
 
 constexpr auto InputPollPeriod = std::chrono::nanoseconds(8'333'333);
 constexpr auto MotionPollPeriod = std::chrono::nanoseconds(16'666'666);
+constexpr auto DirectDiscoveryPeriod = std::chrono::milliseconds(500);
 
 class SampleCadence
 {
